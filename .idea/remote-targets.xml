@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="RemoteTargetsManager">
+    <option name="projectDefaultTargetUuid" value="629c5985-fe1f-4e0b-9d6e-372af9703a85" />
+    <targets>
+      <target name="WSL - Ubuntu" type="wsl" uuid="629c5985-fe1f-4e0b-9d6e-372af9703a85">
+        <config>
+          <option name="distributionMsId" value="Ubuntu" />
+          <option name="projectRootOnTarget" value="/mnt/d/Software/PortableApps/GoLand 2022.1/jbr/bin&#10;/MyRPC" />
+        </config>
+        <ContributedStateBase type="GoLanguageRuntime">
+          <config>
+            <option name="goPath" value="/home/ubuntu/go" />
+            <option name="goRoot" value="/usr/local/go/bin/go" />
+          </config>
+        </ContributedStateBase>
+      </target>
+    </targets>
+  </component>
+</project>
