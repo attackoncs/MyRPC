@@ -102,6 +102,7 @@ func (client *Client) receive() {
 		if err = client.cc.ReadHeader(&h); err != nil {
 			break
 		}
+		//3种：call不存在、call存在但服务器处理出错，即h.Error非空、call存在服务器处理正常，需从body中读取Reply的值
 		call := client.removeCall(h.Seq)
 		switch {
 		case call == nil:
