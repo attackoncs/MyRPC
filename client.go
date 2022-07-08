@@ -1,6 +1,7 @@
 package myrpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"myrpc/codec"
 	"net"
 	"sync"
+	"time"
 )
 
 type Call struct {
@@ -95,6 +97,31 @@ func (client *Client) terminateCalls(err error) {
 	}
 }
 
+func (client *Client) send(call *Call) {
+	client.sending.Lock()
+	defer client.sending.Unlock()
+
+	seq, err := client.registerCall(call)
+	if err != nil {
+		call.Error = err
+		call.done()
+		return
+	}
+	// prepare request header
+	client.header.ServiceMethod = call.ServiceMethod
+	client.header.Seq = seq
+	client.header.Error = ""
+
+	if err := client.cc.Write(&client.header, call.Args); err != nil {
+		call := client.removeCall(seq)
+		if call != nil {
+			call.Error = err
+			call.done()
+		}
+	}
+
+}
+
 func (client *Client) receive() {
 	var err error
 	for err == nil {
@@ -120,6 +147,51 @@ func (client *Client) receive() {
 		}
 	}
 	client.terminateCalls(err)
+}
+
+func (client *Client) Go(serviceMethod string, args, reply interface{}, done chan *Call) *Call {
+	if done == nil {
+		done = make(chan *Call, 10)
+	} else if cap(done) == 0 {
+		log.Panic("rpc client: done channel is unbuffered")
+	}
+	call := &Call{
+		ServiceMethod: serviceMethod,
+		Args:          args,
+		Reply:         reply,
+		Done:          done,
+	}
+	client.send(call)
+	return call
+}
+
+//使用context包实现，控制权交给用户，控制更灵活
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed:" + ctx.Err().Error())
+
+	case call := <-call.Done:
+		return call.Error
+	}
+}
+
+func parseOptions(opts ...*Option) (*Option, error) {
+	// if opts is nil or pass nil as parameter
+	if len(opts) == 0 || opts[0] == nil {
+		return DefaultOption, nil
+	}
+	if len(opts) != 1 {
+		return nil, errors.New("number of options is more than 1")
+	}
+	opt := opts[0]
+	opt.MagicNumber = DefaultOption.MagicNumber
+	if opt.CodecType == "" {
+		opt.CodecType = DefaultOption.CodecType
+	}
+	return opt, nil
 }
 
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
@@ -149,82 +221,47 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 	return client
 }
 
-func Dial(network, address string, opts ...*Option) (Client *Client, err error) {
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.Dial(network, address)
+	//若连接创建超时，则返回错误
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
-
+	//close the connection if client is nil
 	defer func() {
-		if Client == nil {
+		if err != nil {
 			_ = conn.Close()
 		}
 	}()
-	return NewClient(conn, opt)
+	ch := make(chan clientResult)
+	//子协程执行NewClient，执行完后通过信道ch发送结果，若time.After()信道先接收到消息，则说明NewClient执行超时，返回错误
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
 }
 
-func parseOptions(opts ...*Option) (*Option, error) {
-	// if opts is nil or pass nil as parameter
-	if len(opts) == 0 || opts[0] == nil {
-		return DefaultOption, nil
-	}
-	if len(opts) != 1 {
-		return nil, errors.New("number of options is more than 1")
-	}
-	opt := opts[0]
-	opt.MagicNumber = DefaultOption.MagicNumber
-	if opt.CodecType == "" {
-		opt.CodecType = DefaultOption.CodecType
-	}
-	return opt, nil
-}
-
-func (client *Client) send(call *Call) {
-	client.sending.Lock()
-	defer client.sending.Unlock()
-
-	seq, err := client.registerCall(call)
-	if err != nil {
-		call.Error = err
-		call.done()
-		return
-	}
-	// prepare request header
-	client.header.ServiceMethod = call.ServiceMethod
-	client.header.Seq = seq
-	client.header.Error = ""
-
-	if err := client.cc.Write(&client.header, call.Args); err != nil {
-		call := client.removeCall(seq)
-		if call != nil {
-			call.Error = err
-			call.done()
-		}
-	}
-
-}
-
-func (client *Client) Go(serviceMethod string, args, reply interface{}, done chan *Call) *Call {
-	if done == nil {
-		done = make(chan *Call, 10)
-	} else if cap(done) == 0 {
-		log.Panic("rpc client: done channel is unbuffered")
-	}
-	call := &Call{
-		ServiceMethod: serviceMethod,
-		Args:          args,
-		Reply:         reply,
-		Done:          done,
-	}
-	client.send(call)
-	return call
-}
-
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func Dial(network, address string, opts ...*Option) (Client *Client, err error) {
+	return dialTimeout(NewClient, network, address, opts...)
 }
