@@ -12,6 +12,7 @@ import (
 	"log"
 	"myrpc/codec"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -20,14 +21,10 @@ import (
 
 const MagicNumber = 0x3bef5c
 
-//| Option{MagicNumber: xxx, CodecType: xxx} | Header{ServiceMethod ...} | Body interface{} |
-//| <------      固定 JSON 编码      ------>  | <-------   编码方式由 CodeType 决定   ------->|
-// Header和Body可以有多个
-//| Option | Header1 | Body1 | Header2 | Body2 | ...
 type Option struct {
 	MagicNumber    int           // MagicNumber marks this's a myrpc request
 	CodecType      codec.Type    // client may choose different Codec to encode body
-	ConnectTimeout time.Duration //0 means no limit
+	ConnectTimeout time.Duration // 0 means no limit
 	HandleTimeout  time.Duration
 }
 
@@ -40,38 +37,6 @@ var DefaultOption = &Option{
 // Server represents an RPC Server.
 type Server struct {
 	serviceMap sync.Map
-}
-
-func (server *Server) Register(rcvr interface{}) error {
-	s := newService(rcvr)
-	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
-		return errors.New("rpc: service already defined: " + s.name)
-	}
-	return nil
-}
-
-func Register(rcvr interface{}) error {
-	return DefaultServer.Register(rcvr)
-}
-
-func (server *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
-	dot := strings.LastIndex(serviceMethod, ".")
-	if dot < 0 {
-		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
-		return
-	}
-	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
-	svci, ok := server.serviceMap.Load(serviceName)
-	if !ok {
-		err = errors.New("rpc server:can't find service " + serviceName)
-		return
-	}
-	svc = svci.(*service)
-	mtype = svc.method[methodName]
-	if mtype == nil {
-		err = errors.New("rpc server: can't find method " + methodName)
-	}
-	return
 }
 
 // NewServer returns a new Server.
@@ -87,17 +52,14 @@ var DefaultServer = NewServer()
 func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 	defer func() { _ = conn.Close() }()
 	var opt Option
-	//先反序列化得到Option实例
 	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
 		log.Println("rpc server: options error: ", err)
 		return
 	}
-	//检查magicnumber
 	if opt.MagicNumber != MagicNumber {
 		log.Printf("rpc server: invalid magic number %x", opt.MagicNumber)
 		return
 	}
-	//检查CodeType 是否正确，根据 CodeType 得到对应的消息编解码器
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
 		log.Printf("rpc server: invalid codec type %s", opt.CodecType)
@@ -109,20 +71,14 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 // invalidRequest is a placeholder for response argv when error occurs
 var invalidRequest = struct{}{}
 
-//3步
-//读取请求 readRequest
-//处理请求 handleRequest
-//回复请求 sendResponse
 func (server *Server) serveCodec(cc codec.Codec, opt *Option) {
-	sending := new(sync.Mutex) // make sure to send a complete response，请求并发但回复需逐个发送，并发可能导致多个回复交织在一起，客户端无法解析，使用锁保证
+	sending := new(sync.Mutex) // make sure to send a complete response
 	wg := new(sync.WaitGroup)  // wait until all request are handled
 	for {
-		//目前还不能判断 body 的类型，因此在 readRequest 和 handleRequest 中，day1 将 body 作为字符串处理。
-		//接收到请求，打印 header，并回复 myrpc resp ${req.h.Seq}
 		req, err := server.readRequest(cc)
 		if err != nil {
 			if req == nil {
-				break // it's not possible to recover, so close the connection，尽力而为，只有在 header 解析失败时，才终止循环。
+				break // it's not possible to recover, so close the connection
 			}
 			req.h.Error = err.Error()
 			server.sendResponse(cc, req.h, invalidRequest, sending)
@@ -152,6 +108,26 @@ func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 		return nil, err
 	}
 	return &h, nil
+}
+
+func (server *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	svci, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service " + serviceName)
+		return
+	}
+	svc = svci.(*service)
+	mtype = svc.method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server: can't find method " + methodName)
+	}
+	return
 }
 
 func (server *Server) readRequest(cc codec.Codec) (*request, error) {
@@ -187,10 +163,7 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 	}
 }
 
-//使用了协程并发执行请求。超时实现和client接近，使用time.After()结合select+chan完成
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
-	// TODO, should call registered rpc methods to get the right replyv
-	// day 1, just print argv and send a hello message
 	defer wg.Done()
 	called := make(chan struct{})
 	sent := make(chan struct{})
@@ -206,6 +179,7 @@ func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.
 		server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 		sent <- struct{}{}
 	}()
+
 	if timeout == 0 {
 		<-called
 		<-sent
@@ -236,3 +210,57 @@ func (server *Server) Accept(lis net.Listener) {
 // Accept accepts connections on the listener and serves requests
 // for each incoming connection.
 func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
+
+// Register publishes in the server the set of methods of the
+// receiver value that satisfy the following conditions:
+//	- exported method of exported type
+//	- two arguments, both of exported type
+//	- the second argument is a pointer
+//	- one return value, of type error
+func (server *Server) Register(rcvr interface{}) error {
+	s := newService(rcvr)
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc: service already defined: " + s.name)
+	}
+	return nil
+}
+
+// Register publishes the receiver's methods in the DefaultServer.
+func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
+
+const (
+	connected        = "200 Connected to Gee RPC"
+	defaultRPCPath   = "/_myrpc_"
+	defaultDebugPath = "/debug/myrpc"
+)
+
+// ServeHTTP implements an http.Handler that answers RPC requests.
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	server.ServeConn(conn)
+}
+
+// HandleHTTP registers an HTTP handler for RPC messages on rpcPath,
+// and a debugging handler on debugPath.
+// It is still necessary to invoke http.Serve(), typically in a go statement.
+func (server *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, server)
+	http.Handle(defaultDebugPath, debugHTTP{server})
+	log.Println("rpc server debug path:", defaultDebugPath)
+}
+
+// HandleHTTP is a convenient approach for default server to register HTTP handlers
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
+}
